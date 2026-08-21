@@ -1,0 +1,358 @@
+# Running loadtest.py Alongside pgbench
+
+A practical, step-by-step guide for pairing the OS contention script with a
+real PostgreSQL workload — the hands-on core of M-OS-02. Everything here
+assumes `loadtest.py` (with `--no-fsync` support) and a PostgreSQL instance
+are both on the same lab VM.
+
+---
+
+## 1. One-time setup
+
+```bash
+# Install PostgreSQL if not already present
+sudo dnf install -y postgresql-server postgresql-contrib
+sudo postgresql-setup --initdb
+sudo systemctl enable --now postgresql
+
+# Create a test database and load pgbench's built-in schema
+sudo -u postgres createdb bankforge
+sudo -u postgres pgbench -i -s 50 bankforge     # scale factor 50 ≈ 750MB dataset
+
+# Confirm it's there
+sudo -u postgres psql -d bankforge -c '\dt'
+```
+
+`-s 50` is a good starting scale factor for a small lab VM — big enough that
+`pgbench` generates real I/O, small enough that a 2-4 vCPU / 4GB VM handles
+it without choking on setup. Scale up (`-s 100`, `-s 200`) if your dataset
+should exceed available RAM for a stronger effect.
+
+**Confirm the two tools won't collide on resources you care about:**
+```bash
+nproc                                          # CPU cores available
+free -h                                        # RAM available
+df -h $(sudo -u postgres psql -tAc "SHOW data_directory;")   # PGDATA disk space
+```
+
+---
+
+## 2. The basic pairing pattern
+
+Four terminals (or four `tmux`/`screen` panes) is the cleanest setup:
+
+| Terminal | Purpose |
+|---|---|
+| 1 | `loadtest.py` — the background OS-level contention |
+| 2 | `pgbench` — the workload you're trying to protect |
+| 3 | OS-level monitoring (`vmstat`, `iostat`, `/proc/meminfo`) |
+| 4 | Postgres-level monitoring (`psql` running `pg_stat_*` queries) |
+
+**Terminal 1:**
+```bash
+python3 loadtest.py --duration 120
+```
+
+**Terminal 2 — start this a few seconds after Terminal 1 so contention is
+already established when pgbench begins measuring:**
+```bash
+pgbench -c 10 -j 2 -T 90 -P 5 bankforge
+```
+- `-c 10` — 10 concurrent client connections
+- `-j 2` — 2 worker threads driving those connections
+- `-T 90` — run for 90 seconds (shorter than loadtest's 120s so it finishes
+  inside the contention window, not after it)
+- `-P 5` — print a progress line every 5 seconds, which is what lets you see
+  *when* during the run latency got worse, not just the final average
+
+**Terminal 3:**
+```bash
+watch -n1 'grep Dirty /proc/meminfo; echo; vmstat 1 2 | tail -1'
+```
+
+**Terminal 4:**
+```bash
+watch -n2 "sudo -u postgres psql -d bankforge -c \"SELECT datname, numbackends, xact_commit, blks_read, blks_hit FROM pg_stat_database WHERE datname='bankforge';\""
+```
+
+---
+
+## 3. Establish your baseline first — always
+
+Before introducing any contention, run `pgbench` alone and record the
+numbers. Every comparison in this guide is against this baseline, so don't
+skip it.
+
+```bash
+pgbench -c 10 -j 2 -T 60 -P 5 bankforge
+```
+
+Write down:
+```
+tps = ______________
+latency average = ______________ ms
+```
+
+---
+
+## 4. Scenario A — general contention (CPU + memory + disk, default fsync mode)
+
+This is the "noisy neighbor" scenario: something else on the box is eating
+CPU, memory, and disk, and you want to see how much it degrades Postgres.
+
+```bash
+# Terminal 1
+python3 loadtest.py --duration 120
+
+# Terminal 2 (start ~5s later)
+pgbench -c 10 -j 2 -T 90 -P 5 bankforge
+```
+
+**What to watch for:**
+- `tps` should drop noticeably below baseline
+- `latency average` should rise, and the `-P 5` interval output should show
+  more variance run-to-run than the baseline did
+- In Terminal 4, `pg_stat_activity` may show backends sitting `active` with
+  no lock — check with:
+  ```sql
+  SELECT pid,
+         state,
+         wait_event_type,
+         wait_event,
+         query
+  FROM pg_stat_activity
+  WHERE state = 'active';
+  ```
+  A row showing `state = 'active'` together with `wait_event_type = 'IO'`
+  indicates the backend is currently waiting on an I/O-related kernel event.
+  **Be precise about what this does and doesn't prove:** it tells you
+  PostgreSQL itself is waiting on I/O — it does not, by itself, confirm that
+  storage is the actual bottleneck. Corroborate it with `iostat`'s
+  `w_await`/`aqu-sz` (Terminal 3) before concluding storage is at fault; the
+  same `wait_event_type = 'IO'` can also show up briefly under perfectly
+  healthy I/O, so it's a lead to follow, not a verdict on its own.
+
+---
+
+## 5. Scenario B — dirty page buildup (the `vm.dirty_ratio` demo)
+
+This isolates the specific failure mode from the M-OS-02 war story: writes
+piling up in the kernel's page cache until a forced flush stalls everything
+behind it. Use `--no-fsync` so `loadtest.py`'s I/O workers generate dirty
+pages instead of forcing them to disk immediately.
+
+```bash
+# Terminal 1
+python3 loadtest.py --duration 120 --no-fsync
+
+# Terminal 3 — this is the number that matters most in this scenario
+watch -n1 'grep Dirty /proc/meminfo'
+
+# Terminal 2 (start ~5s later)
+pgbench -c 10 -j 2 -T 90 -P 5 bankforge
+```
+
+**What to watch for:**
+- `Dirty:` in Terminal 3 climbing steadily instead of staying flat. In
+  buffered (`--no-fsync`) mode, `Dirty:` should generally run higher than in
+  the default fsync-per-block mode — but don't expect a specific number.
+  The magnitude depends on total RAM, filesystem, storage backend, kernel
+  version, write rate, the current `vm.dirty_*` thresholds, and how long the
+  scenario runs. Treat the *comparison* (buffered vs. fsync, or before vs.
+  after tuning) as the evidence, not any single absolute value.
+- `pgbench`'s `-P 5` interval output should show occasional bad intervals
+  correlating with points where `Dirty:` was high or just got flushed —
+  this correlation *is* the demo
+- In Terminal 4, query checkpoint statistics **using the view that matches
+  your PostgreSQL version** — this moved in PostgreSQL 17:
+
+  ```
+  PostgreSQL <= 16   ->   pg_stat_bgwriter
+  PostgreSQL >= 17   ->   pg_stat_checkpointer
+  ```
+
+  **PostgreSQL 16 and earlier:**
+  ```sql
+  SELECT checkpoints_timed,
+         checkpoints_req,
+         buffers_checkpoint,
+         checkpoint_sync_time
+  FROM pg_stat_bgwriter;
+  ```
+
+  **PostgreSQL 17 and later** (checkpoint stats were split out of
+  `pg_stat_bgwriter` into their own view):
+  ```sql
+  SELECT num_timed,
+         num_requested,
+         buffers_written,
+         sync_time
+  FROM pg_stat_checkpointer;
+  ```
+
+  Run this before and after the scenario in either case — a jump in the
+  requested-checkpoint count or sync time during the run means Postgres's
+  own checkpointer got caught in the same dirty-page backlog. Check
+  `SELECT version();` first if you're not sure which view your instance uses.
+
+**Now fix it and rerun the identical scenario:**
+```bash
+sudo sysctl -w vm.dirty_background_ratio=5
+sudo sysctl -w vm.dirty_ratio=10
+
+# rerun Scenario B exactly as above
+```
+`Dirty:` should now stay lower and flatter, and `pgbench` latency variance
+should shrink. This before/after pair is the deliverable for M-OS-02 Step 2.
+
+---
+
+## 6. Scenario C — Reduced CPU contention / memory-pressure experiment
+
+`loadtest.py` now supports explicit per-category worker counts
+(`--cpu-workers`, `--memory-workers`, `--io-workers`, `--mixed-workers`,
+`--idle-workers`, each accepting `0` to disable that category). Use these to
+build a genuinely memory-focused scenario instead of just turning CPU workers
+down — a run with `--oversub 0.3` alone still spawns the default I/O and
+mixed workers too (2 disk workers, 2 mixed workers), so it isn't isolating
+memory on its own. To actually isolate memory pressure:
+
+```bash
+# Terminal 1 — memory workers only, everything else disabled
+python3 loadtest.py --duration 120 --cpu-workers 0 --io-workers 0 --mixed-workers 0 --idle-workers 0 --memory-workers 6
+
+# Terminal 3
+watch -n1 'vmstat 1 2 | tail -1'   # watch si/so columns specifically
+
+# Terminal 2 (start ~5s later)
+pgbench -c 10 -j 2 -T 90 -P 5 bankforge
+```
+
+`--memory-workers 6` cycles through the 100/200/300MB sizes twice (six
+workers, ~1.2GB total) — adjust upward if your lab VM has enough RAM that a
+smaller allocation doesn't create visible pressure; the goal is to get
+`free -m`'s `available` column noticeably lower than idle, not necessarily
+to force swapping.
+
+If you instead want a **reduced-CPU-contention** variant (some CPU noise,
+but less than the default 2.5x oversubscription, alongside the normal
+disk/mixed/idle workers) — which is what the earlier `--oversub 0.3` command
+actually produces — that's a legitimate scenario too, just a different one:
+
+```bash
+python3 loadtest.py --duration 120 --oversub 0.3
+```
+
+Don't call this "memory pressure only" in your notes — it's reduced CPU
+contention with the normal memory/disk/mixed workers still present. Use the
+explicit `--*-workers 0` flags above when the experiment specifically needs
+to isolate one resource category.
+
+Check `si`/`so` (swap in/out) in `vmstat` — with default `vm.swappiness=60`
+under real pressure you may see these turn non-zero; with `vm.swappiness=1`
+they should stay near zero. For the THP portion of this scenario, check
+`cat /sys/kernel/mm/transparent_hugepage/enabled` before/after disabling it
+and look for `pgbench` interval latency spikes that don't correlate with any
+CPU or I/O signal — that disconnect is the THP signature.
+
+---
+
+## 7. Reading pgbench output correctly
+
+```
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 50
+query mode: simple
+number of clients: 10
+number of threads: 2
+duration: 90 s
+number of transactions actually processed: 34521
+latency average = 26.073 ms
+tps = 383.552341 (including connections establishing)
+```
+
+- **`tps`** — the single headline number for before/after comparison.
+- **`latency average`** — mean, so a few very bad outliers can hide inside a
+  reasonable-looking average. This is why `-P 5` matters more than the final
+  summary — the interval printouts reveal spikes the average smooths over.
+- Add `--latency-histogram` (newer pgbench versions) or note the per-interval
+  latency numbers from `-P 5` if you want to show variance, not just the mean,
+  in your before/after report.
+
+---
+
+## 8. Cleanup between scenarios
+
+```bash
+# Confirm loadtest.py fully exited and cleaned its temp files
+ps -ef | grep loadtest
+df -h /tmp
+
+# Reset pgbench's own accounting between scenario runs if comparing tps directly
+sudo -u postgres psql -d bankforge -c 'SELECT pg_stat_reset();'
+```
+
+Always `Ctrl+C` `loadtest.py` and confirm it has fully exited (it cleans up
+its own `/tmp` files and terminates children on `KeyboardInterrupt`) before
+starting the next scenario — running two `loadtest.py` instances
+simultaneously without intending to will double every contention effect and
+make your before/after numbers meaningless.
+
+---
+
+## 9. Quick reference — all experiments
+
+| Scenario | Command | What it isolates |
+|---|---|---|
+| Baseline | `pgbench` alone, no `loadtest.py` | Control measurement |
+| A — general contention | `loadtest.py --duration 120` | Combined CPU/memory/disk noise |
+| B — dirty page buildup | `loadtest.py --duration 120 --no-fsync` | `vm.dirty_ratio` / checkpoint stalls |
+| C1 — memory pressure only | `loadtest.py --duration 120 --cpu-workers 0 --io-workers 0 --mixed-workers 0 --idle-workers 0 --memory-workers 6` | `vm.swappiness` / THP, isolated |
+| C2 — reduced CPU contention | `loadtest.py --duration 120 --oversub 0.3` | Lighter CPU noise alongside normal disk/mixed/idle workers |
+
+Run each scenario twice — once against default `sysctl` values, once after
+applying the relevant fix from M-OS-02 — and you have a complete, data-backed
+before/after story for the module.
+
+---
+
+## 10. Recording results — five numbers per experiment, not one
+
+The classic mistake in this kind of lab is: "I changed the parameter and TPS
+went up, therefore the parameter was the fix." That's a correlation, not a
+proven cause. Have students capture **five numbers**, not just `tps`, for
+every experiment — the OS-level metric has to move in the direction that
+explains the PostgreSQL-level result before you credit the change:
+
+```
+                    BASELINE       TUNED
+------------------------------------------------
+pgbench TPS         ________       ________
+Latency avg          ________       ________
+CPU utilization      ________       ________
+I/O w_await           ________       ________
+Dirty: (peak)        ________       ________
+```
+
+Then apply this check before accepting a tuning change as the real fix:
+
+```
+        Did pgbench TPS/latency improve?
+                     |
+                    YES
+                     |
+     Did the matching OS metric also improve?
+   (Dirty: down for Step 2, si/so down for Step 3, etc.)
+                     |
+                    YES
+                     |
+              Keep the change — you've
+           established causality, not just
+                   correlation
+```
+
+If TPS improved but the OS metric didn't move in the expected direction,
+something else changed between runs (background process, cache warm-up,
+system noise) — rerun the experiment before crediting the sysctl change.
+This is the difference between "I tuned Postgres" and "I tuned Postgres and
+can prove why it worked."
