@@ -1,0 +1,349 @@
+
+#!/usr/bin/env python3
+
+import multiprocessing as mp
+import os
+import time
+import math
+import random
+
+
+# ============================================================
+# LAB CONFIGURATION
+# ============================================================
+
+DURATION = 300  # 5 minutes
+
+# Maximum TOTAL disk space used by all I/O workers
+MAX_TOTAL_DISK_GB = 5
+
+# Two I/O workers -> 2.5 GiB each
+IO_WORKERS = 2
+
+MAX_TOTAL_DISK_BYTES = MAX_TOTAL_DISK_GB * 1024 * 1024 * 1024
+PER_WORKER_DISK_BYTES = MAX_TOTAL_DISK_BYTES // IO_WORKERS
+
+BLOCK_SIZE = 1024 * 1024  # 1 MB
+
+
+# ============================================================
+# CPU WORKER
+# ============================================================
+
+def cpu_worker(name, duration):
+
+    print(f"[{os.getpid()}] {name}: CPU intensive process")
+
+    end_time = time.time() + duration
+
+    x = 0.0001
+
+    while time.time() < end_time:
+
+        x = math.sin(x) * math.cos(x) + math.sqrt(abs(x) + 1)
+
+    print(f"[{os.getpid()}] {name}: finished")
+
+
+# ============================================================
+# CPU WORKER 2
+# ============================================================
+
+def cpu_worker_2(name, duration):
+
+    print(f"[{os.getpid()}] {name}: CPU intensive process 2")
+
+    end_time = time.time() + duration
+
+    value = 1234567
+
+    while time.time() < end_time:
+
+        value = (value * 1103515245 + 12345) & 0x7FFFFFFF
+
+    print(f"[{os.getpid()}] {name}: finished")
+
+
+# ============================================================
+# MEMORY WORKER
+# ============================================================
+
+def memory_worker(name, size_mb, duration):
+
+    print(f"[{os.getpid()}] {name}: allocating {size_mb} MB")
+
+    data = bytearray(size_mb * 1024 * 1024)
+
+    # Touch every page so memory is actually committed
+    page_size = 4096
+
+    for i in range(0, len(data), page_size):
+        data[i] = 1
+
+    print(f"[{os.getpid()}] {name}: holding {size_mb} MB")
+
+    time.sleep(duration)
+
+    del data
+
+    print(f"[{os.getpid()}] {name}: released memory")
+
+
+# ============================================================
+# DISK I/O WORKER
+# ============================================================
+
+def io_worker(name, duration, max_bytes):
+
+    pid = os.getpid()
+
+    filename = f"/tmp/{name}_{pid}.dat"
+
+    print(
+        f"[{pid}] {name}: disk I/O process "
+        f"(maximum file size = {max_bytes / (1024**3):.2f} GiB)"
+    )
+
+    block = os.urandom(BLOCK_SIZE)
+
+    end_time = time.time() + duration
+
+    bytes_written = 0
+
+    try:
+
+        with open(filename, "w+b", buffering=0) as f:
+
+            while time.time() < end_time:
+
+                # ------------------------------------------------
+                # Phase 1:
+                # Grow the file until the configured limit.
+                # ------------------------------------------------
+
+                if bytes_written < max_bytes:
+
+                    remaining = max_bytes - bytes_written
+
+                    write_size = min(BLOCK_SIZE, remaining)
+
+                    f.write(block[:write_size])
+
+                    f.flush()
+
+                    os.fsync(f.fileno())
+
+                    bytes_written += write_size
+
+                # ------------------------------------------------
+                # Phase 2:
+                # Once maximum size is reached, overwrite the file.
+                # This creates continuous disk I/O without increasing
+                # disk usage.
+                # ------------------------------------------------
+
+                else:
+
+                    f.seek(0)
+
+                    bytes_written = 0
+
+                    print(
+                        f"[{pid}] {name}: "
+                        f"5 GB total disk limit reached - "
+                        f"reusing existing file"
+                    )
+
+    finally:
+
+        if os.path.exists(filename):
+            os.remove(filename)
+
+    print(f"[{pid}] {name}: finished")
+
+
+# ============================================================
+# MIXED CPU + MEMORY WORKER
+# ============================================================
+
+def mixed_worker(name, duration):
+
+    print(f"[{os.getpid()}] {name}: mixed workload")
+
+    data = bytearray(50 * 1024 * 1024)
+
+    end_time = time.time() + duration
+
+    while time.time() < end_time:
+
+        # CPU activity
+        for _ in range(100000):
+            math.sqrt(random.random() + 1)
+
+        # Memory activity
+        for i in range(0, len(data), 4096 * 100):
+            data[i] = (data[i] + 1) % 255
+
+        time.sleep(0.1)
+
+    del data
+
+    print(f"[{os.getpid()}] {name}: finished")
+
+
+# ============================================================
+# IDLE WORKER
+# ============================================================
+
+def idle_worker(name, duration):
+
+    print(f"[{os.getpid()}] {name}: mostly idle process")
+
+    time.sleep(duration)
+
+    print(f"[{os.getpid()}] {name}: finished")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 60)
+    print("POSTGRESQL DBA OS PERFORMANCE LAB")
+    print("=" * 60)
+
+    print(f"Duration              : {DURATION} seconds")
+    print(f"Maximum disk usage    : {MAX_TOTAL_DISK_GB} GiB TOTAL")
+    print(f"I/O workers           : {IO_WORKERS}")
+    print(
+        f"Maximum per I/O file : "
+        f"{PER_WORKER_DISK_BYTES / (1024**3):.2f} GiB"
+    )
+
+    print("=" * 60)
+
+    processes = [
+
+        # --------------------------------------------------------
+        # CPU
+        # --------------------------------------------------------
+
+        mp.Process(
+            target=cpu_worker,
+            args=("CPU_HIGH", DURATION)
+        ),
+
+        mp.Process(
+            target=cpu_worker_2,
+            args=("CPU_MEDIUM", DURATION)
+        ),
+
+        # --------------------------------------------------------
+        # MEMORY
+        # --------------------------------------------------------
+
+        mp.Process(
+            target=memory_worker,
+            args=("MEMORY_100MB", 100, DURATION)
+        ),
+
+        mp.Process(
+            target=memory_worker,
+            args=("MEMORY_200MB", 200, DURATION)
+        ),
+
+        mp.Process(
+            target=memory_worker,
+            args=("MEMORY_300MB", 300, DURATION)
+        ),
+
+        # --------------------------------------------------------
+        # DISK I/O
+        # --------------------------------------------------------
+
+        mp.Process(
+            target=io_worker,
+            args=("IO_WORKER_1", DURATION, PER_WORKER_DISK_BYTES)
+        ),
+
+        mp.Process(
+            target=io_worker,
+            args=("IO_WORKER_2", DURATION, PER_WORKER_DISK_BYTES)
+        ),
+
+        # --------------------------------------------------------
+        # MIXED
+        # --------------------------------------------------------
+
+        mp.Process(
+            target=mixed_worker,
+            args=("MIXED_1", DURATION)
+        ),
+
+        mp.Process(
+            target=mixed_worker,
+            args=("MIXED_2", DURATION)
+        ),
+
+        # --------------------------------------------------------
+        # IDLE
+        # --------------------------------------------------------
+
+        mp.Process(
+            target=idle_worker,
+            args=("IDLE", DURATION)
+        ),
+    ]
+
+    print()
+    print("Starting 10 workload processes...")
+    print("-" * 60)
+
+    for p in processes:
+
+        p.start()
+
+        print(
+            f"Started PID: {p.pid:<8} "
+            f"Process: {p.name}"
+        )
+
+    print("-" * 60)
+
+    print("All processes started.")
+    print()
+    print("Monitor from another terminal:")
+    print("  top")
+    print("  vmstat 1")
+    print("  iostat -xz 1")
+    print("  pidstat -urd 1")
+    print("  free -h")
+    print("  df -h /tmp")
+    print()
+    print("Press Ctrl+C to stop the lab.")
+
+    try:
+
+        for p in processes:
+            p.join()
+
+    except KeyboardInterrupt:
+
+        print("\nStopping all processes...")
+
+        for p in processes:
+
+            if p.is_alive():
+                p.terminate()
+
+        for p in processes:
+            p.join()
+
+        print("All processes stopped.")
+
+
+if __name__ == "__main__":
+    main()
+
