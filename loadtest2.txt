@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+
+import argparse
+import multiprocessing as mp
+import os
+import time
+import math
+import random
+
+
+# ============================================================
+# LAB CONFIGURATION
+# ============================================================
+
+# CHANGE 1: scale worker count to the box instead of hardcoding it.
+# A fixed "2 CPU workers" only produces oversubscription on a 2-vCPU VM.
+# Tying it to os.cpu_count() means the lab produces the same teaching
+# effect (load average > core count) on any machine a student runs it on.
+CPU_COUNT = os.cpu_count() or 2
+OVERSUB_FACTOR = 2.5  # total CPU-bound workers = CPU_COUNT * this
+
+# Maximum TOTAL disk space used by all I/O workers
+MAX_TOTAL_DISK_GB = 5
+
+# Two I/O workers -> 2.5 GiB each (kept fixed; disk contention doesn't
+# need to scale with core count the way CPU contention does)
+IO_WORKERS = 2
+
+MAX_TOTAL_DISK_BYTES = MAX_TOTAL_DISK_GB * 1024 * 1024 * 1024
+PER_WORKER_DISK_BYTES = MAX_TOTAL_DISK_BYTES // IO_WORKERS
+
+BLOCK_SIZE = 1024 * 1024  # 1 MB
+
+
+# ============================================================
+# CHANGE 3: shared timestamp helper so every worker's print lines up
+# cleanly against a second terminal running iostat/vmstat/pidstat.
+# ============================================================
+
+def ts():
+    return time.strftime("%H:%M:%S")
+
+
+def log(pid, name, message):
+    print(f"[{ts()}] [{pid}] {name}: {message}")
+
+
+# ============================================================
+# CPU WORKER (floating point)
+# ============================================================
+
+def cpu_worker(name, duration):
+
+    pid = os.getpid()
+    log(pid, name, "CPU intensive process (floating point)")
+
+    end_time = time.time() + duration
+
+    x = 0.0001
+
+    while time.time() < end_time:
+
+        x = math.sin(x) * math.cos(x) + math.sqrt(abs(x) + 1)
+
+    log(pid, name, "finished")
+
+
+# ============================================================
+# CPU WORKER 2 (integer)
+# ============================================================
+
+def cpu_worker_2(name, duration):
+
+    pid = os.getpid()
+    log(pid, name, "CPU intensive process (integer)")
+
+    end_time = time.time() + duration
+
+    value = 1234567
+
+    while time.time() < end_time:
+
+        value = (value * 1103515245 + 12345) & 0x7FFFFFFF
+
+    log(pid, name, "finished")
+
+
+# ============================================================
+# MEMORY WORKER
+# ============================================================
+
+def memory_worker(name, size_mb, duration):
+
+    pid = os.getpid()
+    log(pid, name, f"allocating {size_mb} MB")
+
+    data = bytearray(size_mb * 1024 * 1024)
+
+    # Touch every page so memory is actually committed
+    page_size = 4096
+
+    for i in range(0, len(data), page_size):
+        data[i] = 1
+
+    log(pid, name, f"holding {size_mb} MB")
+
+    time.sleep(duration)
+
+    del data
+
+    log(pid, name, "released memory")
+
+
+# ============================================================
+# DISK I/O WORKER
+# ============================================================
+
+def io_worker(name, duration, max_bytes):
+
+    pid = os.getpid()
+
+    filename = f"/tmp/{name}_{pid}.dat"
+
+    log(
+        pid, name,
+        f"disk I/O process (maximum file size = {max_bytes / (1024**3):.2f} GiB)"
+    )
+
+    block = os.urandom(BLOCK_SIZE)
+
+    end_time = time.time() + duration
+
+    bytes_written = 0
+
+    try:
+
+        with open(filename, "w+b", buffering=0) as f:
+
+            while time.time() < end_time:
+
+                # CHANGE 4: narrow try/except around the actual I/O calls.
+                # If /tmp fills up or a permission/disk error occurs mid-run,
+                # the original script let the raw traceback kill this worker
+                # silently while the other 9 processes kept running with no
+                # visible signal that one had died. Now we log clearly and
+                # exit this worker on its own rather than crashing unlabeled.
+                try:
+
+                    if bytes_written < max_bytes:
+
+                        remaining = max_bytes - bytes_written
+
+                        write_size = min(BLOCK_SIZE, remaining)
+
+                        f.write(block[:write_size])
+
+                        f.flush()
+
+                        os.fsync(f.fileno())
+
+                        bytes_written += write_size
+
+                    else:
+
+                        f.seek(0)
+
+                        bytes_written = 0
+
+                        log(
+                            pid, name,
+                            f"{max_bytes / (1024**3):.2f} GiB limit reached - "
+                            f"reusing existing file"
+                        )
+
+                except OSError as e:
+
+                    log(pid, name, f"I/O ERROR: {e} — stopping this worker")
+                    break
+
+    finally:
+
+        if os.path.exists(filename):
+            os.remove(filename)
+
+    log(pid, name, "finished")
+
+
+# ============================================================
+# MIXED CPU + MEMORY WORKER
+# ============================================================
+
+def mixed_worker(name, duration):
+
+    pid = os.getpid()
+    log(pid, name, "mixed workload")
+
+    data = bytearray(50 * 1024 * 1024)
+
+    end_time = time.time() + duration
+
+    while time.time() < end_time:
+
+        # CPU activity
+        for _ in range(100000):
+            math.sqrt(random.random() + 1)
+
+        # Memory activity
+        for i in range(0, len(data), 4096 * 100):
+            data[i] = (data[i] + 1) % 255
+
+        time.sleep(0.1)
+
+    del data
+
+    log(pid, name, "finished")
+
+
+# ============================================================
+# IDLE WORKER
+# ============================================================
+
+def idle_worker(name, duration):
+
+    pid = os.getpid()
+    log(pid, name, "mostly idle process")
+
+    time.sleep(duration)
+
+    log(pid, name, "finished")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description="PostgreSQL DBA OS Performance Lab — synthetic mixed workload"
+    )
+
+    # CHANGE 2: duration is now a CLI arg instead of a hardcoded constant.
+    # Makes it painless to run a 30-second smoke test while building a
+    # module instead of editing the file every time.
+    parser.add_argument(
+        "--duration", type=int, default=300,
+        help="How long to run the workload, in seconds (default: 300)"
+    )
+
+    parser.add_argument(
+        "--oversub", type=float, default=OVERSUB_FACTOR,
+        help=f"CPU-bound worker oversubscription factor (default: {OVERSUB_FACTOR})"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+
+    args = parse_args()
+    duration = args.duration
+
+    # CHANGE 1 (cont.): compute CPU-bound worker count from core count.
+    # Alternate floating-point / integer workers so the mix stays varied
+    # even when this scales up to many workers on a bigger box.
+    cpu_worker_count = max(2, round(CPU_COUNT * args.oversub))
+
+    print("=" * 60)
+    print("POSTGRESQL DBA OS PERFORMANCE LAB")
+    print("=" * 60)
+
+    print(f"Duration              : {duration} seconds")
+    print(f"Detected CPU cores    : {CPU_COUNT}")
+    print(f"Oversubscription      : {args.oversub}x -> {cpu_worker_count} CPU-bound workers")
+    print(f"Maximum disk usage    : {MAX_TOTAL_DISK_GB} GiB TOTAL")
+    print(f"I/O workers           : {IO_WORKERS}")
+    print(
+        f"Maximum per I/O file  : "
+        f"{PER_WORKER_DISK_BYTES / (1024**3):.2f} GiB"
+    )
+
+    print("=" * 60)
+
+    processes = []
+
+    # --------------------------------------------------------
+    # CPU — scaled to CPU_COUNT * oversub, alternating worker types
+    # --------------------------------------------------------
+
+    for i in range(cpu_worker_count):
+
+        target = cpu_worker if i % 2 == 0 else cpu_worker_2
+        label = "CPU_FLOAT" if i % 2 == 0 else "CPU_INT"
+
+        processes.append(
+            mp.Process(target=target, args=(f"{label}_{i}", duration))
+        )
+
+    # --------------------------------------------------------
+    # MEMORY
+    # --------------------------------------------------------
+
+    for size_mb in (100, 200, 300):
+
+        processes.append(
+            mp.Process(
+                target=memory_worker,
+                args=(f"MEMORY_{size_mb}MB", size_mb, duration)
+            )
+        )
+
+    # --------------------------------------------------------
+    # DISK I/O
+    # --------------------------------------------------------
+
+    for i in range(1, IO_WORKERS + 1):
+
+        processes.append(
+            mp.Process(
+                target=io_worker,
+                args=(f"IO_WORKER_{i}", duration, PER_WORKER_DISK_BYTES)
+            )
+        )
+
+    # --------------------------------------------------------
+    # MIXED
+    # --------------------------------------------------------
+
+    for i in range(1, 3):
+
+        processes.append(
+            mp.Process(target=mixed_worker, args=(f"MIXED_{i}", duration))
+        )
+
+    # --------------------------------------------------------
+    # IDLE
+    # --------------------------------------------------------
+
+    processes.append(mp.Process(target=idle_worker, args=("IDLE", duration)))
+
+    print()
+    print(f"Starting {len(processes)} workload processes...")
+    print("-" * 60)
+
+    for p in processes:
+
+        p.start()
+
+        print(f"[{ts()}] Started PID: {p.pid:<8} Process: {p.name}")
+
+    print("-" * 60)
+
+    print("All processes started.")
+    print()
+    print("Monitor from another terminal:")
+    print("  top")
+    print("  vmstat 1")
+    print("  iostat -xz 1")
+    print("  pidstat -urd 1")
+    print("  free -h")
+    print("  df -h /tmp")
+    print()
+    print("Press Ctrl+C to stop the lab.")
+
+    try:
+
+        for p in processes:
+            p.join()
+
+    except KeyboardInterrupt:
+
+        print(f"\n[{ts()}] Stopping all processes...")
+
+        for p in processes:
+
+            if p.is_alive():
+                p.terminate()
+
+        for p in processes:
+            p.join()
+
+        print(f"[{ts()}] All processes stopped.")
+
+
+if __name__ == "__main__":
+    main()
