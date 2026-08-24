@@ -721,6 +721,25 @@ In PostgreSQL's SQL/PGQ syntax, `GRAPH_TABLE` is used to express this pattern.
 Conceptually:
 
 ```sql
+
+CREATE PROPERTY GRAPH ecommerce
+    VERTEX TABLES (
+        products LABEL product,
+        customers LABEL customer,
+        orders LABEL "order"
+    )
+    EDGE TABLES (
+        order_items
+            SOURCE orders
+            DESTINATION products
+            LABEL contains,
+
+        customer_orders
+            SOURCE customers
+            DESTINATION orders
+            LABEL placed
+    );
+
 SELECT *
 FROM GRAPH_TABLE (
     ecommerce
