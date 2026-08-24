@@ -1,3 +1,7 @@
+pg_plan_advice is a PostgreSQL module that lets you guide or constrain the query planner’s major plan decisions, such as join order, join method, scan method, and parallel execution.
+
+JOIN_ORDER(o c r) tells PostgreSQL the preferred order in which to build the joins: orders → customers → regions.
+
 ```
 
 postgres=# EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, PLAN_ADVICE)
